@@ -187,15 +187,140 @@ function synthDing() {
 }
 
 async function chime() {
-  const ok = await playSound(sound);
-  if (!ok) synthDing();
   setLast("🔔 " + new Date().toLocaleTimeString() + " · " + displayName(sound));
+  await playSelected();
 }
 
 function displayName(value: string): string {
   if (value.startsWith("imp:")) return value.slice(4);
   if (value.startsWith("builtin:")) return value.slice(8);
   return value;
+}
+
+// ---------------------------------------------------------------------------
+// 系统播放（service / afplay）：完成提示优先让宿主侧服务出声，面板关闭/
+// 不可见时照样响；服务未授权、故障或播放失败则回退上面的 Web Audio 路径。
+// ---------------------------------------------------------------------------
+
+type SvcState = "unknown" | "ready" | "denied" | "broken";
+let svcState: SvcState = "unknown";
+/** 已上传到服务的导入音效名（服务进程重启后靠 404 触发重传） */
+const svcUploaded = new Set<string>();
+const svcUploading = new Map<string, Promise<boolean>>();
+/** service 请求体上限 64,000 字符，留 JSON 信封余量 */
+const SVC_CHUNK = 63_500;
+
+function renderStatus() {
+  const tail =
+    svcState === "ready"
+      ? " · 系统播放就绪：面板关闭也会响"
+      : svcState === "denied"
+        ? " · 系统播放未授权（Settings → Extensions 允许本地服务后生效），当前仅面板内播放"
+        : svcState === "broken"
+          ? " · 系统服务异常，回退面板播放"
+          : "";
+  setStatus("监听已连接 ✓" + tail);
+}
+
+/** 面板永远拿不到 service token，只能经宿主代理；错误按 code 归类状态 */
+async function svcCall(
+  method: "GET" | "POST",
+  path: string,
+  body?: unknown,
+): Promise<{ status: number; body: string } | null> {
+  if (typeof host.serviceRequest !== "function") return null;
+  try {
+    return await host.serviceRequest({
+      method,
+      path,
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  } catch (err) {
+    const code = (err as { code?: string })?.code;
+    if (code === "NO_SERVICE" || code === "DISABLED") svcState = "denied";
+    else if (code === "SERVICE_FAILED") svcState = "broken";
+    renderStatus();
+    return null;
+  }
+}
+
+/** onReady 时提前拉起服务（首次 spawn 约几百毫秒），避免第一声迟到 */
+async function warmService() {
+  const r = await svcCall("GET", "/health");
+  if (r && r.status === 200) {
+    svcState = "ready";
+    renderStatus();
+    warmUploadCurrent();
+  }
+}
+
+function warmUploadCurrent() {
+  if (svcState === "ready" && sound.startsWith("imp:")) {
+    void ensureUpload(sound.slice(4));
+  }
+}
+
+/** 把导入音效分块 POST 给服务缓存（64KB 请求体上限所致），带去重 */
+function ensureUpload(name: string): Promise<boolean> {
+  if (svcUploaded.has(name)) return Promise.resolve(true);
+  let pending = svcUploading.get(name);
+  if (!pending) {
+    pending = (async () => {
+      const meta = library[name];
+      if (!meta) return false;
+      const b64 = await loadImpB64(name);
+      if (!b64) return false;
+      const total = Math.ceil(b64.length / SVC_CHUNK);
+      for (let i = 0; i < total; i++) {
+        const r = await svcCall("POST", "/audio", {
+          name,
+          mime: meta.mime,
+          index: i,
+          total,
+          data: b64.slice(i * SVC_CHUNK, (i + 1) * SVC_CHUNK),
+        });
+        if (!r || r.status !== 200) return false;
+      }
+      svcUploaded.add(name);
+      return true;
+    })().finally(() => svcUploading.delete(name));
+    svcUploading.set(name, pending);
+  }
+  return pending;
+}
+
+/** 服务端 afplay 播放；true = 已由系统出声（含静音跳过） */
+async function playViaService(value: string): Promise<boolean> {
+  if (svcState === "broken") return false;
+  if (value.startsWith("imp:") && !(await ensureUpload(value.slice(4)))) {
+    return false;
+  }
+  let r = await svcCall("POST", "/chime", { sound: value, volume });
+  if (!r) return false;
+  if (r.status === 200) {
+    if (svcState !== "ready") {
+      svcState = "ready";
+      renderStatus();
+    }
+    return true;
+  }
+  // 404 = 服务重启过、导入音缓存丢失 → 重传一次再试
+  if (r.status === 404 && value.startsWith("imp:")) {
+    const name = value.slice(4);
+    if (svcUploaded.delete(name) && (await ensureUpload(name))) {
+      r = await svcCall("POST", "/chime", { sound: value, volume });
+      if (r && r.status === 200) return true;
+    }
+  }
+  // 其余 4xx/5xx（如 afplay 不支持的格式）→ 回退 Web Audio
+  return false;
+}
+
+/** 播放选中音效：系统播放优先，失败回退面板 Web Audio，再不行合成兜底 */
+async function playSelected() {
+  if (await playViaService(sound)) return;
+  const ok = await playSound(sound);
+  if (!ok) synthDing();
 }
 
 // ---------------------------------------------------------------------------
@@ -320,6 +445,8 @@ async function importFile(file: File) {
   bufferCache.set("imp:" + name, decoded);
   sound = "imp:" + name;
   await host.storage.set("sound", sound);
+  svcUploaded.delete(name); // 同名重导入时服务端缓存作废
+  warmUploadCurrent();
   rebuildSelect();
   setMsg(`✓ 已导入「${name}」（${decoded.duration.toFixed(1)}s，${n} 块）`);
   playSound(sound); // 导入成功即试听
@@ -338,6 +465,7 @@ async function deleteImported(name: string) {
     delete library[name];
     await host.storage.set(LIB_KEY, library);
     bufferCache.delete("imp:" + name);
+    svcUploaded.delete(name);
     setMsg(`✓ 已删除「${name}」`);
   } catch (err) {
     setMsg(
@@ -398,6 +526,7 @@ host.onReady((ctx) => {
     snd.onchange = () => {
       sound = snd.value;
       host.storage.set("sound", sound);
+      warmUploadCurrent(); // 换成导入音时预热上传，第一声不迟到
       playSound(sound); // 切换即试听
     };
 
@@ -418,7 +547,7 @@ host.onReady((ctx) => {
     vol.onchange = () => host.storage.set("volume", volume);
   }
 
-  if (test) test.onclick = () => playSound(sound);
+  if (test) test.onclick = () => playSelected();
   if (del) del.onclick = handleDeleteClick;
   if (imp && file) {
     imp.onclick = () => file.click();
@@ -429,7 +558,8 @@ host.onReady((ctx) => {
     };
   }
 
-  setStatus("监听已连接 ✓");
+  renderStatus();
+  void warmService(); // 提前 spawn 服务，任务完成那声不用等冷启动
 });
 
 // 核心：只对「我们见过它 started」的会话响应完成/失败。
@@ -448,8 +578,10 @@ host.onSessionLifecycle((event) => {
       if (!onlyFailure) chime();
       else setLast("任务完成（静音） " + new Date().toLocaleTimeString());
     } else {
-      chime();
-      setLast("⚠️ 任务失败 " + new Date().toLocaleTimeString());
+      // chime 内部会先写一行 🔔，等它播完再落最终显示，避免异步顺序把 ⚠️ 冲掉
+      chime()
+        .catch(() => {})
+        .then(() => setLast("⚠️ 任务失败 " + new Date().toLocaleTimeString()));
     }
   }
 });
@@ -474,6 +606,7 @@ Promise.all([
   }
   applyVolume();
   rebuildSelect();
+  warmUploadCurrent(); // 选中的是导入音且服务已就绪 → 预传
 
   const fail = d("onlyFailure") as HTMLInputElement | null;
   if (fail) fail.checked = onlyFailure;

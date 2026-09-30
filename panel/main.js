@@ -1213,21 +1213,112 @@
     }
   }
   async function chime() {
-    const ok = await playSound(sound);
-    if (!ok) synthDing();
-    setLast("\u{1F514} " + (/* @__PURE__ */ new Date()).toLocaleTimeString() + " \xB7 " + displayName(sound));
+    setLast("🔔 " + (/* @__PURE__ */ new Date()).toLocaleTimeString() + " · " + displayName(sound));
+    await playSelected();
   }
   function displayName(value) {
     if (value.startsWith("imp:")) return value.slice(4);
     if (value.startsWith("builtin:")) return value.slice(8);
     return value;
   }
+  var svcState = "unknown";
+  var svcUploaded = /* @__PURE__ */ new Set();
+  var svcUploading = /* @__PURE__ */ new Map();
+  var SVC_CHUNK = 63500;
+  function renderStatus() {
+    const tail = svcState === "ready" ? " · 系统播放就绪：面板关闭也会响" : svcState === "denied" ? " · 系统播放未授权（Settings → Extensions 允许本地服务后生效），当前仅面板内播放" : svcState === "broken" ? " · 系统服务异常，回退面板播放" : "";
+    setStatus("监听已连接 ✓" + tail);
+  }
+  async function svcCall(method, path, body) {
+    if (typeof host.serviceRequest !== "function") return null;
+    try {
+      return await host.serviceRequest({
+        method,
+        path,
+        body: body === void 0 ? void 0 : JSON.stringify(body)
+      });
+    } catch (err) {
+      const code = err?.code;
+      if (code === "NO_SERVICE" || code === "DISABLED") svcState = "denied";
+      else if (code === "SERVICE_FAILED") svcState = "broken";
+      renderStatus();
+      return null;
+    }
+  }
+  async function warmService() {
+    const r = await svcCall("GET", "/health");
+    if (r && r.status === 200) {
+      svcState = "ready";
+      renderStatus();
+      warmUploadCurrent();
+    }
+  }
+  function warmUploadCurrent() {
+    if (svcState === "ready" && sound.startsWith("imp:")) {
+      void ensureUpload(sound.slice(4));
+    }
+  }
+  function ensureUpload(name) {
+    if (svcUploaded.has(name)) return Promise.resolve(true);
+    let pending = svcUploading.get(name);
+    if (!pending) {
+      pending = (async () => {
+        const meta = library[name];
+        if (!meta) return false;
+        const b64 = await loadImpB64(name);
+        if (!b64) return false;
+        const total = Math.ceil(b64.length / SVC_CHUNK);
+        for (let i = 0; i < total; i++) {
+          const r = await svcCall("POST", "/audio", {
+            name,
+            mime: meta.mime,
+            index: i,
+            total,
+            data: b64.slice(i * SVC_CHUNK, (i + 1) * SVC_CHUNK)
+          });
+          if (!r || r.status !== 200) return false;
+        }
+        svcUploaded.add(name);
+        return true;
+      })().finally(() => svcUploading.delete(name));
+      svcUploading.set(name, pending);
+    }
+    return pending;
+  }
+  async function playViaService(value) {
+    if (svcState === "broken") return false;
+    if (value.startsWith("imp:") && !await ensureUpload(value.slice(4))) {
+      return false;
+    }
+    let r = await svcCall("POST", "/chime", { sound: value, volume });
+    if (!r) return false;
+    if (r.status === 200) {
+      if (svcState !== "ready") {
+        svcState = "ready";
+        renderStatus();
+      }
+      return true;
+    }
+    if (r.status === 404 && value.startsWith("imp:")) {
+      const name = value.slice(4);
+      if (svcUploaded.delete(name) && await ensureUpload(name)) {
+        r = await svcCall("POST", "/chime", { sound: value, volume });
+        if (r && r.status === 200) return true;
+      }
+    }
+    return false;
+  }
+  async function playSelected() {
+    if (await playViaService(sound)) return;
+    const ok = await playSound(sound);
+    if (!ok) synthDing();
+  }
   function rebuildSelect() {
     const snd = d("sound");
     if (!snd) return;
     snd.innerHTML = "";
     const sys = document.createElement("optgroup");
-    sys.label = "\u7CFB\u7EDF\u97F3\u6548";
+    sys.label = "系统音效";
     for (const name of Object.keys(SOUNDS)) {
       const opt = document.createElement("option");
       opt.value = "builtin:" + name;
@@ -1238,12 +1329,12 @@
     const names = Object.keys(library).sort((a, b) => a.localeCompare(b));
     if (names.length > 0) {
       const imp = document.createElement("optgroup");
-      imp.label = "\u6211\u7684\u97F3\u6548";
+      imp.label = "我的音效";
       for (const name of names) {
         const opt = document.createElement("option");
         opt.value = "imp:" + name;
         const dur = library[name].duration.toFixed(1);
-        opt.textContent = `${name}\uFF08${dur}s\uFF09`;
+        opt.textContent = `${name}（${dur}s）`;
         imp.appendChild(opt);
       }
       snd.appendChild(imp);
@@ -1262,31 +1353,31 @@
   }
   async function importFile(file) {
     if (!await ensureCtx()) {
-      setMsg("\u2717 \u5F53\u524D\u73AF\u5883\u65E0\u53EF\u7528\u97F3\u9891\u8BBE\u5907", true);
+      setMsg("✗ 当前环境无可用音频设备", true);
       return;
     }
     if (file.size > MAX_FILE) {
-      setMsg("\u2717 \u6587\u4EF6\u8D85\u8FC7 4MB \u4E0A\u9650", true);
+      setMsg("✗ 文件超过 4MB 上限", true);
       return;
     }
-    setMsg("\u6B63\u5728\u89E3\u7801 " + file.name + " \u2026");
+    setMsg("正在解码 " + file.name + " …");
     let bytes;
     try {
       bytes = new Uint8Array(await file.arrayBuffer());
     } catch {
-      setMsg("\u2717 \u8BFB\u53D6\u6587\u4EF6\u5931\u8D25", true);
+      setMsg("✗ 读取文件失败", true);
       return;
     }
     let decoded;
     try {
       decoded = await audioCtx.decodeAudioData(bytes.buffer.slice(0));
     } catch {
-      setMsg("\u2717 \u65E0\u6CD5\u89E3\u7801\u8BE5\u683C\u5F0F\uFF08\u652F\u6301 mp3 / wav / m4a / aac / ogg / flac\uFF09", true);
+      setMsg("✗ 无法解码该格式（支持 mp3 / wav / m4a / aac / ogg / flac）", true);
       return;
     }
     if (decoded.duration > MAX_DUR) {
       setMsg(
-        `\u2717 \u63D0\u793A\u97F3\u8FC7\u957F\uFF08${decoded.duration.toFixed(1)}s\uFF0C\u4E0A\u9650 ${MAX_DUR}s\uFF09`,
+        `✗ 提示音过长（${decoded.duration.toFixed(1)}s，上限 ${MAX_DUR}s）`,
         true
       );
       return;
@@ -1315,7 +1406,7 @@
       })));
       delete library[name];
       setMsg(
-        "\u2717 \u5B58\u50A8\u5931\u8D25\uFF1A" + (err instanceof Error ? err.message : String(err)),
+        "✗ 存储失败：" + (err instanceof Error ? err.message : String(err)),
         true
       );
       return;
@@ -1323,8 +1414,10 @@
     bufferCache.set("imp:" + name, decoded);
     sound = "imp:" + name;
     await host.storage.set("sound", sound);
+    svcUploaded.delete(name);
+    warmUploadCurrent();
     rebuildSelect();
-    setMsg(`\u2713 \u5DF2\u5BFC\u5165\u300C${name}\u300D\uFF08${decoded.duration.toFixed(1)}s\uFF0C${n} \u5757\uFF09`);
+    setMsg(`✓ 已导入「${name}」（${decoded.duration.toFixed(1)}s，${n} 块）`);
     playSound(sound);
   }
   var pendingDelete = null;
@@ -1339,10 +1432,11 @@
       delete library[name];
       await host.storage.set(LIB_KEY, library);
       bufferCache.delete("imp:" + name);
-      setMsg(`\u2713 \u5DF2\u5220\u9664\u300C${name}\u300D`);
+      svcUploaded.delete(name);
+      setMsg(`✓ 已删除「${name}」`);
     } catch (err) {
       setMsg(
-        "\u2717 \u5220\u9664\u5931\u8D25\uFF1A" + (err instanceof Error ? err.message : String(err)),
+        "✗ 删除失败：" + (err instanceof Error ? err.message : String(err)),
         true
       );
       return;
@@ -1359,17 +1453,17 @@
     const name = sound.slice(4);
     if (pendingDelete !== name) {
       pendingDelete = name;
-      del.textContent = "\u786E\u8BA4\u5220\u9664?";
+      del.textContent = "确认删除?";
       if (deleteTimer) clearTimeout(deleteTimer);
       deleteTimer = setTimeout(() => {
         pendingDelete = null;
-        del.textContent = "\u{1F5D1} \u5220\u9664";
+        del.textContent = "🗑 删除";
       }, 3e3);
       return;
     }
     pendingDelete = null;
     if (deleteTimer) clearTimeout(deleteTimer);
-    del.textContent = "\u{1F5D1} \u5220\u9664";
+    del.textContent = "🗑 删除";
     deleteImported(name);
   }
   host.onReady((ctx) => {
@@ -1387,6 +1481,7 @@
       snd.onchange = () => {
         sound = snd.value;
         host.storage.set("sound", sound);
+        warmUploadCurrent();
         playSound(sound);
       };
     if (fail)
@@ -1404,7 +1499,7 @@
       };
       vol.onchange = () => host.storage.set("volume", volume);
     }
-    if (test) test.onclick = () => playSound(sound);
+    if (test) test.onclick = () => playSelected();
     if (del) del.onclick = handleDeleteClick;
     if (imp && file) {
       imp.onclick = () => file.click();
@@ -1414,7 +1509,8 @@
         file.value = "";
       };
     }
-    setStatus("\u76D1\u542C\u5DF2\u8FDE\u63A5 \u2713");
+    renderStatus();
+    void warmService();
   });
   host.onSessionLifecycle((event) => {
     const { sessionId, phase } = event;
@@ -1428,10 +1524,10 @@
       }
       if (phase === "completed") {
         if (!onlyFailure) chime();
-        else setLast("\u4EFB\u52A1\u5B8C\u6210\uFF08\u9759\u97F3\uFF09 " + (/* @__PURE__ */ new Date()).toLocaleTimeString());
+        else setLast("任务完成（静音） " + (/* @__PURE__ */ new Date()).toLocaleTimeString());
       } else {
-        chime();
-        setLast("\u26A0\uFE0F \u4EFB\u52A1\u5931\u8D25 " + (/* @__PURE__ */ new Date()).toLocaleTimeString());
+        chime().catch(() => {
+        }).then(() => setLast("⚠️ 任务失败 " + (/* @__PURE__ */ new Date()).toLocaleTimeString()));
       }
     }
   });
@@ -1453,6 +1549,7 @@
     }
     applyVolume();
     rebuildSelect();
+    warmUploadCurrent();
     const fail = d("onlyFailure");
     if (fail) fail.checked = onlyFailure;
     const vol = d("volume");
@@ -1462,6 +1559,6 @@
       if (volLabel) volLabel.textContent = volume + "%";
     }
     const cnt = Object.keys(library).length;
-    if (cnt > 0) setMsg(`\u5DF2\u52A0\u8F7D ${cnt} \u4E2A\u5BFC\u5165\u97F3\u6548`);
+    if (cnt > 0) setMsg(`已加载 ${cnt} 个导入音效`);
   });
 })();
