@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>Task Chime</title>
+    <script src="main.js"></script>
+    <style>
+      body {
+        font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        padding: 16px;
+        margin: 0;
+      }
+      h1 { font-size: 16px; margin: 0 0 6px; }
+      p { margin: 0 0 14px; opacity: 0.75; }
+      .card {
+        background: var(--oc-card, rgba(127, 127, 127, 0.1));
+        border-radius: 12px;
+        padding: 12px 14px;
+        margin-bottom: 12px;
+      }
+      label { display: flex; align-items: center; gap: 10px; margin: 8px 0; }
+      select { flex: 1; min-width: 0; }
+      .row { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
+      .row .grow { flex: 1; min-width: 0; }
+      #status { font-size: 12px; opacity: 0.7; margin-top: 8px; }
+      #msg { font-size: 12px; min-height: 16px; margin-top: 4px; }
+      #last { font-size: 12px; opacity: 0.6; }
+      button {
+        border: 0; border-radius: 8px; padding: 7px 14px; cursor: pointer;
+        background: var(--oc-primary, #0a84ff); color: #fff; font-size: 13px;
+        white-space: nowrap;
+      }
+      button:disabled { opacity: 0.4; cursor: default; }
+      button.ghost {
+        background: var(--oc-card, rgba(127, 127, 127, 0.15));
+        color: inherit;
+      }
+      input[type="range"] { flex: 1; min-width: 0; accent-color: var(--oc-primary, #0a84ff); }
+      #volLabel { width: 40px; text-align: right; font-variant-numeric: tabular-nums; }
+      input[type="file"] { display: none; }
+    </style>
+  </head>
+  <body>
+    <h1>🔔 Task Chime</h1>
+    <p>智能体任务完成时响一声。内置 8 款原创音效，可导入自己的音频、调节音量。</p>
+    <div class="card">
+      <label>音效
+        <select id="sound"><!-- 由 main.js 动态生成 --></select>
+      </label>
+
+      <div class="row">
+        <button id="test" type="button">▶ 试听</button>
+        <button id="importBtn" type="button" class="ghost">＋ 导入音效</button>
+        <button id="del" type="button" class="ghost" disabled>🗑 删除</button>
+        <input type="file" id="import" accept="audio/*" />
+      </div>
+
+      <label>音量
+        <input type="range" id="volume" min="0" max="100" step="1" />
+        <span id="volLabel">80%</span>
+      </label>
+
+      <label><input type="checkbox" id="onlyFailure" /> 只在失败时响</label>
+      <div id="status">等待连接…</div>
+      <div id="msg"></div>
+    </div>
+    <div id="last">等待第一个任务完成…</div>
+  </body>
+</html>
