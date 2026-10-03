@@ -1105,6 +1105,42 @@
     }
     r.turn++;
     running.add(id);
+    markSeen(id);
+  }
+  var CATCHUP_MS = 5 * 60 * 1e3;
+  var SEEN_KEY = "chime:seen";
+  var DONE_KEY = "chime:done";
+  var seenMap = {};
+  var doneMap = {};
+  var persistTimer = null;
+  function schedulePersist() {
+    if (persistTimer) return;
+    persistTimer = setTimeout(() => {
+      persistTimer = null;
+      const cutoff = Date.now() - 60 * 60 * 1e3;
+      const prune = (m) => {
+        const out = {};
+        const keys = Object.keys(m).sort((a, b) => m[b] - m[a]);
+        for (const k of keys.slice(0, 100)) {
+          if (m[k] >= cutoff) out[k] = m[k];
+        }
+        return out;
+      };
+      seenMap = prune(seenMap);
+      doneMap = prune(doneMap);
+      host.storage.set(SEEN_KEY, seenMap).catch(() => {
+      });
+      host.storage.set(DONE_KEY, doneMap).catch(() => {
+      });
+    }, 500);
+  }
+  function markSeen(id) {
+    seenMap[id] = Date.now();
+    schedulePersist();
+  }
+  function markDone(id) {
+    doneMap[id] = Date.now();
+    schedulePersist();
   }
   function settleTurn(id, outcome) {
     let r = feed.get(id);
@@ -1114,14 +1150,20 @@
     }
     running.delete(id);
     if (r.turn <= 0) {
-      dbg("suppress", `${outcome} · ${shortId(id)} · 未见过开跑`);
-      return;
+      const fresh = (seenMap[id] ?? 0) > (doneMap[id] ?? 0) && Date.now() - (seenMap[id] ?? 0) < CATCHUP_MS;
+      if (!fresh) {
+        dbg("suppress", `${outcome} · ${shortId(id)} · 未见过开跑`);
+        return;
+      }
+      dbg("catchup", `${outcome} · ${shortId(id)} · reload 后补结算`);
+      r.turn = 1;
     }
     if (r.chimedTurn === r.turn) {
       dbg("suppress", `${outcome} · ${shortId(id)} · 本轮已响过`);
       return;
     }
     r.chimedTurn = r.turn;
+    markDone(id);
     if (outcome === "failed") {
       chime().catch(() => {
       }).then(() => setLast("⚠️ 任务失败 " + (/* @__PURE__ */ new Date()).toLocaleTimeString()));
@@ -1696,11 +1738,15 @@
     host.storage.get("sound"),
     host.storage.get("onlyFailure"),
     host.storage.get("volume"),
-    host.storage.get(LIB_KEY)
-  ]).then(([s, f, v, lib]) => {
+    host.storage.get(LIB_KEY),
+    host.storage.get(SEEN_KEY),
+    host.storage.get(DONE_KEY)
+  ]).then(([s, f, v, lib, seen, done]) => {
     if (typeof f === "boolean") onlyFailure = f;
     if (typeof v === "number" && v >= 0 && v <= 100) volume = v;
     if (lib && typeof lib === "object") library = lib;
+    if (seen && typeof seen === "object") seenMap = seen;
+    if (done && typeof done === "object") doneMap = done;
     if (typeof s === "string") {
       if (s.startsWith("imp:")) {
         if (library[s.slice(4)]) sound = s;

@@ -59,6 +59,46 @@ function noteTurn(id: string) {
   }
   r.turn++;
   running.add(id);
+  markSeen(id);
+}
+
+/** 跨重载补救：面板 reload 会清空内存，持久化的“见过开跑”让 reload 后到达的
+ * 完成照样结算；5 分钟窗口 + done 标记防止对陈年 completed 误响。 */
+const CATCHUP_MS = 5 * 60 * 1000;
+const SEEN_KEY = "chime:seen";
+const DONE_KEY = "chime:done";
+let seenMap: Record<string, number> = {};
+let doneMap: Record<string, number> = {};
+let persistTimer: ReturnType<typeof setTimeout> | null = null;
+
+function schedulePersist() {
+  if (persistTimer) return;
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    const cutoff = Date.now() - 60 * 60 * 1000;
+    const prune = (m: Record<string, number>) => {
+      const out: Record<string, number> = {};
+      const keys = Object.keys(m).sort((a, b) => m[b]! - m[a]!);
+      for (const k of keys.slice(0, 100)) {
+        if (m[k]! >= cutoff) out[k] = m[k]!;
+      }
+      return out;
+    };
+    seenMap = prune(seenMap);
+    doneMap = prune(doneMap);
+    host.storage.set(SEEN_KEY, seenMap).catch(() => {});
+    host.storage.set(DONE_KEY, doneMap).catch(() => {});
+  }, 500);
+}
+
+function markSeen(id: string) {
+  seenMap[id] = Date.now();
+  schedulePersist();
+}
+
+function markDone(id: string) {
+  doneMap[id] = Date.now();
+  schedulePersist();
 }
 
 function settleTurn(id: string, outcome: "completed" | "failed") {
@@ -69,14 +109,23 @@ function settleTurn(id: string, outcome: "completed" | "failed") {
   }
   running.delete(id);
   if (r.turn <= 0) {
-    dbg("suppress", `${outcome} · ${shortId(id)} · 未见过开跑`);
-    return;
+    // 内存里没见过开跑：可能是 reload 丢了状态，查持久化标记补救
+    const fresh =
+      (seenMap[id] ?? 0) > (doneMap[id] ?? 0) &&
+      Date.now() - (seenMap[id] ?? 0) < CATCHUP_MS;
+    if (!fresh) {
+      dbg("suppress", `${outcome} · ${shortId(id)} · 未见过开跑`);
+      return;
+    }
+    dbg("catchup", `${outcome} · ${shortId(id)} · reload 后补结算`);
+    r.turn = 1;
   }
   if (r.chimedTurn === r.turn) {
     dbg("suppress", `${outcome} · ${shortId(id)} · 本轮已响过`);
     return;
   }
   r.chimedTurn = r.turn;
+  markDone(id);
   if (outcome === "failed") {
     chime()
       .catch(() => {})
@@ -803,16 +852,20 @@ host.onSessionLifecycle((event) => {
   }
 });
 
-// 恢复已保存的偏好与导入清单
+// 恢复已保存的偏好、导入清单与回合标记（seen/done 让 reload 不丢轮次）
 Promise.all([
   host.storage.get("sound"),
   host.storage.get("onlyFailure"),
   host.storage.get("volume"),
   host.storage.get(LIB_KEY),
-]).then(([s, f, v, lib]) => {
+  host.storage.get(SEEN_KEY),
+  host.storage.get(DONE_KEY),
+]).then(([s, f, v, lib, seen, done]) => {
   if (typeof f === "boolean") onlyFailure = f;
   if (typeof v === "number" && v >= 0 && v <= 100) volume = v;
   if (lib && typeof lib === "object") library = lib as Library;
+  if (seen && typeof seen === "object") seenMap = seen as Record<string, number>;
+  if (done && typeof done === "object") doneMap = done as Record<string, number>;
   // 先恢复清单再定音效，避免 rebuildSelect 把合法的导入项误判为失效
   if (typeof s === "string") {
     if (s.startsWith("imp:")) {
