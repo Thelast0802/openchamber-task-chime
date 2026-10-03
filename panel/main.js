@@ -1133,9 +1133,26 @@
     }
   }
   var isLiveActivity = (a) => a === "running" || a === "retrying";
-  function onFeedSnapshot(snap) {
+  var feedSeenProjects = /* @__PURE__ */ new Set();
+  function onFeedSnapshot(pid, snap) {
     const list = snap?.sessions;
     if (!Array.isArray(list)) return;
+    if (!feedSeenProjects.has(pid)) {
+      feedSeenProjects.add(pid);
+      const live = [];
+      let total = 0;
+      for (const s of list) {
+        if (!s || typeof s.id !== "string" || s.archivedAt) continue;
+        total++;
+        if (typeof s.activity === "string" && s.activity !== "idle" && s.activity !== "unknown") {
+          live.push(shortId(s.id));
+        }
+      }
+      dbg(
+        "feed",
+        `项目快照 ${total} 会话${live.length ? ` · 跑着：${live.join(",")}` : ""}`
+      );
+    }
     for (const s of list) {
       if (!s || typeof s.id !== "string" || s.archivedAt) continue;
       const cur = typeof s.activity === "string" ? s.activity : "unknown";
@@ -1153,40 +1170,58 @@
         r.turn++;
         running.add(s.id);
         dbg("event", `feed ${cur} · ${shortId(s.id)}`);
-      } else if (cur === "idle" && prev !== "idle" && prev !== "unknown") {
+      } else if (cur === "idle" && prev !== "idle" && (prev !== "unknown" || r.turn > 0)) {
         const outcome = s.outcome === "failed" ? "failed" : "completed";
         dbg("event", `feed idle(${outcome}) · ${shortId(s.id)}`);
         settleTurn(s.id, outcome);
       }
     }
   }
+  var feedProjectIds = /* @__PURE__ */ new Set();
+  var projectsWatched = false;
+  var feedSyncing = false;
+  async function subscribeProject(pid) {
+    const off = await host.onSessions(pid, (s) => onFeedSnapshot(pid, s));
+    if (typeof off !== "function") throw new Error("no-unsubscribe");
+    feedUnsubs.push(off);
+    feedProjectIds.add(pid);
+  }
   async function ensureFeed() {
-    if (feedOn) return;
+    if (feedSyncing) return;
     if (typeof host.listProjects !== "function" || typeof host.onSessions !== "function") {
       feedDenied = true;
       dbg("feed", "宿主不支持会话订阅，仅当前会话");
       renderStatus();
       return;
     }
+    feedSyncing = true;
     try {
-      const snap = await host.listProjects();
-      const ids = snap.projects.map((p) => p.id);
-      let n = 0;
-      for (const pid of ids) {
+      if (!projectsWatched && typeof host.onProjects === "function") {
+        projectsWatched = true;
         try {
-          const off = await host.onSessions(pid, (s) => onFeedSnapshot(s));
-          if (typeof off === "function") {
-            feedUnsubs.push(off);
-            n++;
-          }
+          const off = await host.onProjects(() => {
+            void ensureFeed();
+          });
+          if (typeof off === "function") feedUnsubs.push(off);
+        } catch {
+          projectsWatched = false;
+        }
+      }
+      const snap = await host.listProjects();
+      for (const p of snap.projects) {
+        if (feedProjectIds.has(p.id)) continue;
+        try {
+          await subscribeProject(p.id);
         } catch {
           dbg("feed", `订阅项目失败`);
         }
       }
-      feedProjects = n;
-      feedOn = n > 0;
-      if (feedOn) feedDenied = false;
-      dbg("feed", `已订阅 ${n}/${ids.length} 个项目`);
+      feedProjects = feedProjectIds.size;
+      if (feedProjects > 0) {
+        feedOn = true;
+        feedDenied = false;
+      }
+      dbg("feed", `会话订阅 ${feedProjects}/${snap.projects.length} 个项目`);
     } catch (err) {
       if (err?.code === "NOT_GRANTED") {
         feedDenied = true;
@@ -1194,6 +1229,8 @@
       } else {
         dbg("feed", "不可用，仅当前会话");
       }
+    } finally {
+      feedSyncing = false;
     }
     renderStatus();
   }
