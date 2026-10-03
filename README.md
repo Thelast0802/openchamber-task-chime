@@ -56,7 +56,7 @@ The extension requests two capabilities, each approved once in **Settings → Ex
 ### Known limitations
 
 - The **listener lives in the panel page**, so each project directory's panel must have been opened at least once per app launch (closing it afterwards is fine — the page stays mounted). This is a platform constraint: no other extension surface receives session events.
-- The viewed session is pushed event-by-event; **every other session is tracked through the `sessions` snapshot feed** (v1.2.0+), which needs the `sessions` capability grant. Without it, only the session you're looking at chimes.
+- The viewed session is pushed event-by-event; **every other session in a registered project is tracked through the `sessions` snapshot feed** (v1.2.0+, needs the `sessions` grant; without it, only the viewed session chimes). Floating chats live in their own directories outside any registered project, so the feed can't see them — those chime only while you're viewing them.
 - Imported **ogg** files can't be played by `afplay` (CoreAudio has no Vorbis decoder); the service answers "playback-failed" and the panel falls back to Web Audio. Convert to mp3/m4a/wav for reliable system playback.
 - On non-macOS hosts there is no `afplay`; the same fallback applies.
 - Diagnostics: the panel keeps a 40-entry ring log (`event` / `suppress` / `play` / `feed` / `svc`) in extension storage under `chime:debug` — read it when a chime goes missing.
@@ -151,7 +151,7 @@ Key implementation notes:
 ### 已知限制
 
 - **监听在面板页面里**，因此每个项目目录的面板在本次启动后需至少打开过一次（关掉没关系，页面会保持挂载）。这是平台约束：其它扩展表面收不到会话事件。
-- 正在看的会话走事件直推；**其它会话走 `sessions` 快照订阅**（v1.2.0+），需要批准 `sessions` 能力，否则只有正在看的会话会响。
+- 正在看的会话走事件直推；**已注册项目里的其它会话走 `sessions` 快照订阅**（v1.2.0+，需批 `sessions`），否则只有正在看的会响。浮动聊天自成目录、不在任何已注册项目里，快照看不见——那种只在你看着它时响。
 - 导入的 **ogg** 无法被 `afplay` 播放（CoreAudio 无 Vorbis 解码），会回退面板播放；想要稳定系统播放请转成 mp3/m4a/wav。
 - 非 macOS 宿主没有 `afplay`，同样回退面板播放。
 - 诊断：面板在存储 `chime:debug` 键里留了 40 条环形日志（事件/去重/播放/订阅），丢声音时看它。
