@@ -8,13 +8,13 @@ A minimal-permission OpenChamber extension that plays a chime when your agent fi
 
 ## Features
 
-- 🔔 **Chime on completion** — plays a sound when a session completes or fails, with a **deduplicated lifecycle listener**: switching between idle sessions in history does *not* trigger false chimes (only sessions whose `started` phase was actually observed can chime).
+- 🔔 **Chime on completion** — plays a sound when a session completes or fails, for **every session in every project** (v1.2.0+: the viewed session arrives event-by-event, all others are tracked through the `sessions` snapshot feed). Turn bookkeeping (`noteTurn`/`settleTurn`) means switching between idle sessions in history does *not* trigger false chimes, and the two push paths never double-chime the same turn.
 - 🔊 **Chimes with the panel closed** — completion events are handed to a bundled **local service** (`contributes.service`) that plays through macOS `afplay` at the system level. If the service is unavailable (not yet approved, failed to start, or `afplay` can't play the format), it **falls back to the panel's Web Audio engine** automatically.
 - 🎵 **8 built-in original sounds** — Bell, Marimba, Crystal, Chord, Ping, Whistle, Drop, Sparkle. All synthesized from scratch (additive synthesis / sweeps / transients) by [`scripts/make-sounds.mjs`](scripts/make-sounds.mjs) — no third-party or Apple-copyrighted audio. Built-ins ship inside the service bundle too, so they never cross the request-size limit.
 - 📥 **Import your own sounds** — drop in any audio file (mp3 / wav / m4a / aac / ogg / flac, ≤ 4 MB, ≤ 15 s). Decoded and validated up front, stored chunked across extension storage keys, with rollback on partial writes. For system playback they are uploaded to the service once (chunked, 64 KB request cap) and cached there.
 - 🔊 **Volume slider** — live gain control through a master `GainNode`, persisted; the same value drives `afplay -v`.
 - ⚙️ **Failure-only mode** — optional “only chime on failure”.
-- 🧰 **One capability** — the package requests `service` (declaring `exec: ["afplay"]`) so the host may spawn the playback helper. No network, filesystem, or model capabilities.
+- 🧰 **Two capabilities** — `service` (host spawns the `afplay` playback helper) and `sessions` (read the session list so **background sessions chime too**). No network, filesystem, or model capabilities.
 
 ## Install
 
@@ -28,15 +28,24 @@ Then choose **Add**. Git-URL installs check for updates automatically (or use **
 
 > Requires OpenChamber **≥ 1.24.0**. Web & desktop only (VS Code / mobile don't load extensions yet).
 
-### Approving the local service (v1.1.0+)
+### Approving capabilities (v1.1.0+)
 
-Declaring a service adds a **`service`** capability to what the extension requests. Approve it once in **Settings → Extensions** (the card shows the pending request; the dialog lists `afplay` as the declared command). **After updating from ≤ 1.0.0 you must re-approve** — until then the extension still works, but plays only through the panel (first `serviceRequest` is refused with `NO_SERVICE` and falls back). The panel's status line shows which path is active:
+The extension requests two capabilities, each approved once in **Settings → Extensions**:
+
+| Capability | Since | Why | Until approved |
+|---|---|---|---|
+| `service` (`exec: ["afplay"]`) | v1.1.0 | Host spawns the system-playback helper | Panel Web Audio only (panel must be visible) |
+| `sessions` (read-only session list) | v1.2.0 | Track completions of **all** sessions, including background ones | Only the currently viewed session chimes |
+
+**After updating you must re-approve** whenever the requested list grows — until then the extension keeps working in degraded mode (first `serviceRequest` is refused with `NO_SERVICE`, session snapshots with `NOT_GRANTED`, each falling back gracefully). The panel's status line shows which paths are active:
 
 | Status line | Meaning |
 |---|---|
 | `系统播放就绪：面板关闭也会响` | Service approved & running — system-level `afplay` playback. |
-| `系统播放未授权…` | Not approved (yet) — panel Web Audio only; approve to enable. |
+| `系统播放未授权…` | Service not approved (yet) — panel Web Audio only; approve to enable. |
 | `系统服务异常，回退面板播放` | Service failed to start — panel Web Audio only. |
+| `全会话监听开（N 个项目）` | Session feed live — background sessions chime too. |
+| `全会话监听未授权…` | `sessions` not approved — only the viewed session chimes. |
 
 ## Usage
 
@@ -46,9 +55,11 @@ Declaring a service adds a **`service`** capability to what the extension reques
 
 ### Known limitations
 
-- The **lifecycle listener lives in the panel page**, so the panel must have been opened at least once in the current app session (closing it afterwards is fine — the page stays mounted). This is a platform constraint: no other extension surface receives session events.
+- The **listener lives in the panel page**, so each project directory's panel must have been opened at least once per app launch (closing it afterwards is fine — the page stays mounted). This is a platform constraint: no other extension surface receives session events.
+- The viewed session is pushed event-by-event; **every other session is tracked through the `sessions` snapshot feed** (v1.2.0+), which needs the `sessions` capability grant. Without it, only the session you're looking at chimes.
 - Imported **ogg** files can't be played by `afplay` (CoreAudio has no Vorbis decoder); the service answers "playback-failed" and the panel falls back to Web Audio. Convert to mp3/m4a/wav for reliable system playback.
 - On non-macOS hosts there is no `afplay`; the same fallback applies.
+- Diagnostics: the panel keeps a 40-entry ring log (`event` / `suppress` / `play` / `feed` / `svc`) in extension storage under `chime:debug` — read it when a chime goes missing.
 
 ## Build from source
 
@@ -80,8 +91,9 @@ package.json            manifest (panel id, icon, engines, contributes.service)
 panel/index.html        UI
 panel/main.js           ← build output, committed (IIFE bundle, browser)
 service/main.js         ← build output, committed (CJS bundle, Node — host-spawned)
-src/main.ts             source: lifecycle dedupe, service-first playback + Web Audio fallback,
-                        import/chunking (storage + service upload)
+src/main.ts             source: turn bookkeeping (lifecycle + sessions feed), service-first
+                        playback + Web Audio fallback, import/chunking (storage + service upload),
+                        40-entry debug ring log (`chime:debug`)
 src/service.ts          source: loopback HTTP service (Bearer auth, /health, /chime, /audio) → afplay
 src/sounds.ts           ← generated base64 sound bank (bundled into both entries)
 scripts/make-sounds.mjs sound synthesizer (source of truth for src/sounds.ts)
@@ -96,7 +108,7 @@ panel ──serviceRequest──▶ host ──HTTP 127.0.0.1:port──▶ serv
 
 Key implementation notes:
 
-- **Lifecycle dedupe**: `onSessionLifecycle` replays the current phase of a session when you open it (the host maps `busy/retry → started`, `idle → completed`). The extension keeps a `running` set and only chimes for `completed`/`failure` events of sessions it has seen `started` for.
+- **Lifecycle dedupe → turn bookkeeping**: the viewed session arrives via `onSessionLifecycle` (the host maps `busy/retry → started`, `idle → completed`); every other session is tracked through `onSessions` snapshots (`running/retrying → idle` transitions). Each observed run bumps the session's turn; settling a turn chimes once and marks it, so history replays never false-chime and the two paths never double-chime (same-session events are ordered per channel, so a stale completion can never consume the next turn).
 - **Playback ladder**: `serviceRequest POST /chime` → on `NO_SERVICE`/`DISABLED` the panel marks the service *denied* (single hint, no hammering); on `SERVICE_FAILED` it marks *broken* (retried only when you press 试听); on HTTP 404 after a service restart it re-uploads an imported sound once; on any other failure it plays via Web Audio (`playSound` → synthesized ding as last resort).
 - **Service contract**: bound to the host-allocated `127.0.0.1` port only; every request (including `/health`) needs `Authorization: Bearer <OPENCHAMBER_SERVICE_TOKEN>`; the panel warms it with `GET /health` on ready so spawn (Electron-as-Node, few hundred ms) happens before the first task finishes. `afplay` exit is awaited (≤ 16 s cap) so format failures surface as HTTP 422 and trigger the fallback.
 - **Size limits**: `serviceRequest` bodies cap at 64,000 chars — built-in sounds live in the service bundle, imported sounds are uploaded in 63,500-char chunks (`POST /audio`) once and cached (a 404 tells the panel the service restarted and to re-upload). Extension storage caps values at 65,536 bytes, so imports are also stored chunked (`chime:snd:<name>:<i>`, manifest `chime:library`).
@@ -114,21 +126,22 @@ Key implementation notes:
 
 ### 安装
 
-打开 OpenChamber **设置 → 扩展**，在输入框粘贴本仓库的 git URL，点「添加」即可。git URL 安装支持自动更新，可用 `#v1.1.0` 锁定版本。要求 OpenChamber ≥ 1.24.0（桌面端 / 网页端）。
+打开 OpenChamber **设置 → 扩展**，在输入框粘贴本仓库的 git URL，点「添加」即可。git URL 安装支持自动更新，可用 `#v1.2.0` 锁定版本。要求 OpenChamber ≥ 1.24.0（桌面端 / 网页端）。
 
-### 允许本地服务（v1.1.0 起）
+### 授权（v1.1.0 起 service，v1.2.0 起 sessions）
 
-1.1.0 起扩展声明了 `contributes.service`（`exec: ["afplay"]`），请求列表新增 **`service`** 能力，需要在 **设置 → 扩展** 里点一次允许（审批卡片会列出 `afplay`）。**从 ≤1.0.0 更新上来的必须重新审批**；未审批也能用——只是走面板内播放（`serviceRequest` 返回 `NO_SERVICE` 后自动回退）。面板状态行会显示当前路径：
+扩展申请两个能力，在**设置 → 扩展**里各点一次允许：
 
-| 状态行 | 含义 |
-|---|---|
-| `系统播放就绪：面板关闭也会响` | 服务已批准并运行，`afplay` 系统级播放。 |
-| `系统播放未授权…` | 尚未批准，仅面板内播放；批准后生效。 |
-| `系统服务异常，回退面板播放` | 服务启动失败，回退面板播放。 |
+| 能力 | 用途 | 未批准时 |
+|---|---|---|
+| `service`（`exec: ["afplay"]`） | 宿主拉起系统播放 helper，面板关闭也响 | 仅面板内播放 |
+| `sessions`（只读会话列表） | 跟踪**全部**会话（含后台）的完成 | 仅正在看的会话会响 |
+
+**更新后若能力列表变多，必须重新审批**；批之前扩展降级可用（`NO_SERVICE`/`NOT_GRANTED` 各自回退）。面板状态行会显示当前路径（`全会话监听开` / `全会话监听未授权…`）。
 
 ### 功能
 
-- 完成/失败提示音，**只对真正跑过的任务响**——切换历史会话不会误响
+- 完成/失败提示音，**覆盖全部会话（含后台）**——只对真正跑过的轮次响，切换历史会话不会误响，同一轮不会重响
 - **面板关闭也响**：完成事件交给随包的本地 service，用 macOS `afplay` 系统级播放；服务不可用时自动回退面板 Web Audio
 - 内置 **8 款原创音效**（全部由加法合成本地生成，无版权风险），音效同时打进服务包，不受请求体大小限制
 - **导入自己的音频**（mp3/wav/m4a/aac/ogg/flac，≤4MB、≤15s），自动校验解码；系统播放时分块上传给服务缓存
@@ -137,9 +150,11 @@ Key implementation notes:
 
 ### 已知限制
 
-- **生命周期监听在面板页面里**，因此本次会话内需至少打开过一次面板（关掉没关系，页面会保持挂载）。这是平台约束：其它扩展表面收不到会话事件。
+- **监听在面板页面里**，因此每个项目目录的面板在本次启动后需至少打开过一次（关掉没关系，页面会保持挂载）。这是平台约束：其它扩展表面收不到会话事件。
+- 正在看的会话走事件直推；**其它会话走 `sessions` 快照订阅**（v1.2.0+），需要批准 `sessions` 能力，否则只有正在看的会话会响。
 - 导入的 **ogg** 无法被 `afplay` 播放（CoreAudio 无 Vorbis 解码），会回退面板播放；想要稳定系统播放请转成 mp3/m4a/wav。
 - 非 macOS 宿主没有 `afplay`，同样回退面板播放。
+- 诊断：面板在存储 `chime:debug` 键里留了 40 条环形日志（事件/去重/播放/订阅），丢声音时看它。
 
 ### 从源码构建
 

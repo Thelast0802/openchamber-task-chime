@@ -31,11 +31,173 @@ const MAX_FILE = 4 * 1024 * 1024;
 const MAX_DUR = 15;
 
 /**
- * 问题 2 的修复核心：生命周期事件由会话状态映射（busy/retry → started、
- * idle → completed、其他 → failure），切换历史会话时宿主会重放其当前状态。
- * 只有先见过该会话 started（真的在跑）之后到达的 completed/failure 才响。
+ * 回合去重：生命周期事件由会话状态映射（busy/retry → started、idle →
+ * completed、其他 → failure），切换历史会话时宿主会重放其当前状态。
+ * turn 计数（见 noteTurn/settleTurn）保证只有亲眼见过某轮开跑，才会为它的
+ * 结束响一声；同一轮被两条推送路径各结算一次时，第二条认账不重响。
+ * running 集合保留作“见过开跑”的快速标记（日志与上传预热用）。
  */
 const running = new Set<string>();
+
+// ---------------------------------------------------------------------------
+// 回合记账（单会话事件 + 全会话快照共用）：开跑 → turn+1；完成/失败 →
+// 结算该 turn。两条推送路径先后到达同一轮时，先到的响、后到的认账不重响。
+// ---------------------------------------------------------------------------
+
+type FeedRec = { activity: string; turn: number; chimedTurn: number };
+const feed = new Map<string, FeedRec>();
+let feedOn = false;
+let feedDenied = false;
+let feedProjects = 0;
+const feedUnsubs: Array<() => void> = [];
+
+function noteTurn(id: string) {
+  let r = feed.get(id);
+  if (!r) {
+    r = { activity: "unknown", turn: 0, chimedTurn: 0 };
+    feed.set(id, r);
+  }
+  r.turn++;
+  running.add(id);
+}
+
+function settleTurn(id: string, outcome: "completed" | "failed") {
+  let r = feed.get(id);
+  if (!r) {
+    r = { activity: "unknown", turn: 0, chimedTurn: 0 };
+    feed.set(id, r);
+  }
+  running.delete(id);
+  if (r.turn <= 0) {
+    dbg("suppress", `${outcome} · ${shortId(id)} · 未见过开跑`);
+    return;
+  }
+  if (r.chimedTurn === r.turn) {
+    dbg("suppress", `${outcome} · ${shortId(id)} · 本轮已响过`);
+    return;
+  }
+  r.chimedTurn = r.turn;
+  if (outcome === "failed") {
+    chime()
+      .catch(() => {})
+      .then(() => setLast("⚠️ 任务失败 " + new Date().toLocaleTimeString()));
+  } else if (!onlyFailure) {
+    chime();
+  } else {
+    dbg("suppress", `completed · ${shortId(id)} · 只失败模式`);
+    setLast("任务完成（静音） " + new Date().toLocaleTimeString());
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 全会话监听（sessions capability）：订阅各项目的会话快照，跟踪 activity
+// 翻转（running/retrying → idle），后台会话完成也能响。面板每启动打开一次
+// 即覆盖全部会话；未授权或宿主不支持时退回“仅当前会话”事件。
+// ---------------------------------------------------------------------------
+
+const isLiveActivity = (a: string) => a === "running" || a === "retrying";
+
+type FeedSession = {
+  id: string;
+  activity?: unknown;
+  outcome?: unknown;
+  archivedAt?: unknown;
+};
+
+function onFeedSnapshot(snap: { sessions?: FeedSession[] }) {
+  const list = snap?.sessions;
+  if (!Array.isArray(list)) return;
+  for (const s of list) {
+    if (!s || typeof s.id !== "string" || s.archivedAt) continue;
+    const cur = typeof s.activity === "string" ? s.activity : "unknown";
+    let r = feed.get(s.id);
+    if (!r) {
+      // 首见即基线；打开面板时已经在跑的任务也算见过开跑，完成时要响
+      r = { activity: cur, turn: isLiveActivity(cur) ? 1 : 0, chimedTurn: 0 };
+      feed.set(s.id, r);
+      if (r.turn > 0) running.add(s.id);
+      continue;
+    }
+    const prev = r.activity;
+    r.activity = cur;
+    if (prev === cur) continue;
+    if (isLiveActivity(cur) && !isLiveActivity(prev)) {
+      r.turn++;
+      running.add(s.id);
+      dbg("event", `feed ${cur} · ${shortId(s.id)}`);
+    } else if (cur === "idle" && prev !== "idle" && prev !== "unknown") {
+      const outcome = s.outcome === "failed" ? "failed" : "completed";
+      dbg("event", `feed idle(${outcome}) · ${shortId(s.id)}`);
+      settleTurn(s.id, outcome);
+    }
+  }
+}
+
+async function ensureFeed() {
+  if (feedOn) return;
+  if (
+    typeof host.listProjects !== "function" ||
+    typeof host.onSessions !== "function"
+  ) {
+    feedDenied = true;
+    dbg("feed", "宿主不支持会话订阅，仅当前会话");
+    renderStatus();
+    return;
+  }
+  try {
+    const snap = await host.listProjects();
+    const ids = snap.projects.map((p) => p.id);
+    let n = 0;
+    for (const pid of ids) {
+      try {
+        const off = await host.onSessions(pid, (s) => onFeedSnapshot(s));
+        if (typeof off === "function") {
+          feedUnsubs.push(off);
+          n++;
+        }
+      } catch {
+        dbg("feed", `订阅项目失败`);
+      }
+    }
+    feedProjects = n;
+    feedOn = n > 0;
+    if (feedOn) feedDenied = false;
+    dbg("feed", `已订阅 ${n}/${ids.length} 个项目`);
+  } catch (err) {
+    if ((err as { code?: string })?.code === "NOT_GRANTED") {
+      feedDenied = true;
+      dbg("feed", "NOT_GRANTED：设置里允许会话访问后覆盖全部会话");
+    } else {
+      dbg("feed", "不可用，仅当前会话");
+    }
+  }
+  renderStatus();
+}
+
+// ---------------------------------------------------------------------------
+// 诊断环形日志：记录最近 40 条事件与播放决策，存 storage `chime:debug` 键。
+// 出问题时读这个文件就知道是事件没送达、去重吞了，还是播放失败。
+// ---------------------------------------------------------------------------
+
+type DbgEntry = { t: string; kind: string; info: string };
+const DBG_KEY = "chime:debug";
+const dbgBuf: DbgEntry[] = [];
+let dbgTimer: ReturnType<typeof setTimeout> | null = null;
+
+function shortId(id: string): string {
+  return id.length > 12 ? "…" + id.slice(-8) : id;
+}
+
+function dbg(kind: string, info: string) {
+  dbgBuf.push({ t: new Date().toLocaleTimeString(), kind, info });
+  while (dbgBuf.length > 40) dbgBuf.shift();
+  // 合并写，避免高频事件刷 storage
+  if (dbgTimer) return;
+  dbgTimer = setTimeout(() => {
+    dbgTimer = null;
+    host.storage.set(DBG_KEY, dbgBuf).catch(() => {});
+  }, 500);
+}
 
 // ---------------------------------------------------------------------------
 // DOM 小工具
@@ -211,7 +373,7 @@ const svcUploading = new Map<string, Promise<boolean>>();
 const SVC_CHUNK = 63_500;
 
 function renderStatus() {
-  const tail =
+  const svcTail =
     svcState === "ready"
       ? " · 系统播放就绪：面板关闭也会响"
       : svcState === "denied"
@@ -219,7 +381,12 @@ function renderStatus() {
         : svcState === "broken"
           ? " · 系统服务异常，回退面板播放"
           : "";
-  setStatus("监听已连接 ✓" + tail);
+  const feedTail = feedOn
+    ? ` · 全会话监听开（${feedProjects} 个项目）`
+    : feedDenied
+      ? " · 全会话监听未授权（允许会话访问后后台任务也响），当前仅正在看的会话"
+      : "";
+  setStatus("监听已连接 ✓" + svcTail + feedTail);
 }
 
 /** 面板永远拿不到 service token，只能经宿主代理；错误按 code 归类状态 */
@@ -239,6 +406,7 @@ async function svcCall(
     const code = (err as { code?: string })?.code;
     if (code === "NO_SERVICE" || code === "DISABLED") svcState = "denied";
     else if (code === "SERVICE_FAILED") svcState = "broken";
+    dbg("svc", `${path} err=${code ?? "unknown"}`);
     renderStatus();
     return null;
   }
@@ -246,6 +414,7 @@ async function svcCall(
 
 /** onReady 时提前拉起服务（首次 spawn 约几百毫秒），避免第一声迟到 */
 async function warmService() {
+  dbg("svc", "warm /health …");
   const r = await svcCall("GET", "/health");
   if (r && r.status === 200) {
     svcState = "ready";
@@ -318,8 +487,12 @@ async function playViaService(value: string): Promise<boolean> {
 
 /** 播放选中音效：系统播放优先，失败回退面板 Web Audio，再不行合成兜底 */
 async function playSelected() {
-  if (await playViaService(sound)) return;
+  if (await playViaService(sound)) {
+    dbg("play", `service ok · ${displayName(sound)} · vol ${volume}`);
+    return;
+  }
   const ok = await playSound(sound);
+  dbg("play", ok ? `webaudio ok · ${displayName(sound)}` : "webaudio fail → synth");
   if (!ok) synthDing();
 }
 
@@ -547,7 +720,10 @@ host.onReady((ctx) => {
     vol.onchange = () => host.storage.set("volume", volume);
   }
 
-  if (test) test.onclick = () => playSelected();
+  if (test) test.onclick = () => {
+    void ensureFeed(); // 审批通过后点试听即补上订阅，无需重开面板
+    playSelected();
+  };
   if (del) del.onclick = handleDeleteClick;
   if (imp && file) {
     imp.onclick = () => file.click();
@@ -560,29 +736,19 @@ host.onReady((ctx) => {
 
   renderStatus();
   void warmService(); // 提前 spawn 服务，任务完成那声不用等冷启动
+  void ensureFeed(); // 订阅全会话快照，后台任务完成也能响
 });
 
-// 核心：只对「我们见过它 started」的会话响应完成/失败。
+// 双推送路径共用回合记账：当前会话事件（快）+ 全会话快照（全），先到先响。
 host.onSessionLifecycle((event) => {
   const { sessionId, phase } = event;
+  dbg("event", `${phase} · ${shortId(sessionId)} · turn=${feed.get(sessionId)?.turn ?? 0}`);
   if (phase === "started") {
-    running.add(sessionId);
+    noteTurn(sessionId);
     return;
   }
   if (phase === "completed" || phase === "failure") {
-    if (!running.delete(sessionId)) {
-      // 没见过 started：这是切换会话时重放的历史空闲状态，忽略。
-      return;
-    }
-    if (phase === "completed") {
-      if (!onlyFailure) chime();
-      else setLast("任务完成（静音） " + new Date().toLocaleTimeString());
-    } else {
-      // chime 内部会先写一行 🔔，等它播完再落最终显示，避免异步顺序把 ⚠️ 冲掉
-      chime()
-        .catch(() => {})
-        .then(() => setLast("⚠️ 任务失败 " + new Date().toLocaleTimeString()));
-    }
+    settleTurn(sessionId, phase === "failure" ? "failed" : "completed");
   }
 });
 

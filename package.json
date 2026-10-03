@@ -1,6 +1,6 @@
 {
   "name": "openchamber-task-chime",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "openchamber": {
     "apiVersion": 1,
     "engines": {
@@ -19,7 +19,8 @@
         "permissions": {
           "exec": ["afplay"]
         }
-      }
+      },
+      "capabilities": ["sessions"]
     }
   },
   "devDependencies": {

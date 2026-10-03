@@ -1092,6 +1092,127 @@
   var MAX_FILE = 4 * 1024 * 1024;
   var MAX_DUR = 15;
   var running = /* @__PURE__ */ new Set();
+  var feed = /* @__PURE__ */ new Map();
+  var feedOn = false;
+  var feedDenied = false;
+  var feedProjects = 0;
+  var feedUnsubs = [];
+  function noteTurn(id) {
+    let r = feed.get(id);
+    if (!r) {
+      r = { activity: "unknown", turn: 0, chimedTurn: 0 };
+      feed.set(id, r);
+    }
+    r.turn++;
+    running.add(id);
+  }
+  function settleTurn(id, outcome) {
+    let r = feed.get(id);
+    if (!r) {
+      r = { activity: "unknown", turn: 0, chimedTurn: 0 };
+      feed.set(id, r);
+    }
+    running.delete(id);
+    if (r.turn <= 0) {
+      dbg("suppress", `${outcome} · ${shortId(id)} · 未见过开跑`);
+      return;
+    }
+    if (r.chimedTurn === r.turn) {
+      dbg("suppress", `${outcome} · ${shortId(id)} · 本轮已响过`);
+      return;
+    }
+    r.chimedTurn = r.turn;
+    if (outcome === "failed") {
+      chime().catch(() => {
+      }).then(() => setLast("⚠️ 任务失败 " + (/* @__PURE__ */ new Date()).toLocaleTimeString()));
+    } else if (!onlyFailure) {
+      chime();
+    } else {
+      dbg("suppress", `completed · ${shortId(id)} · 只失败模式`);
+      setLast("任务完成（静音） " + (/* @__PURE__ */ new Date()).toLocaleTimeString());
+    }
+  }
+  var isLiveActivity = (a) => a === "running" || a === "retrying";
+  function onFeedSnapshot(snap) {
+    const list = snap?.sessions;
+    if (!Array.isArray(list)) return;
+    for (const s of list) {
+      if (!s || typeof s.id !== "string" || s.archivedAt) continue;
+      const cur = typeof s.activity === "string" ? s.activity : "unknown";
+      let r = feed.get(s.id);
+      if (!r) {
+        r = { activity: cur, turn: isLiveActivity(cur) ? 1 : 0, chimedTurn: 0 };
+        feed.set(s.id, r);
+        if (r.turn > 0) running.add(s.id);
+        continue;
+      }
+      const prev = r.activity;
+      r.activity = cur;
+      if (prev === cur) continue;
+      if (isLiveActivity(cur) && !isLiveActivity(prev)) {
+        r.turn++;
+        running.add(s.id);
+        dbg("event", `feed ${cur} · ${shortId(s.id)}`);
+      } else if (cur === "idle" && prev !== "idle" && prev !== "unknown") {
+        const outcome = s.outcome === "failed" ? "failed" : "completed";
+        dbg("event", `feed idle(${outcome}) · ${shortId(s.id)}`);
+        settleTurn(s.id, outcome);
+      }
+    }
+  }
+  async function ensureFeed() {
+    if (feedOn) return;
+    if (typeof host.listProjects !== "function" || typeof host.onSessions !== "function") {
+      feedDenied = true;
+      dbg("feed", "宿主不支持会话订阅，仅当前会话");
+      renderStatus();
+      return;
+    }
+    try {
+      const snap = await host.listProjects();
+      const ids = snap.projects.map((p) => p.id);
+      let n = 0;
+      for (const pid of ids) {
+        try {
+          const off = await host.onSessions(pid, (s) => onFeedSnapshot(s));
+          if (typeof off === "function") {
+            feedUnsubs.push(off);
+            n++;
+          }
+        } catch {
+          dbg("feed", `订阅项目失败`);
+        }
+      }
+      feedProjects = n;
+      feedOn = n > 0;
+      if (feedOn) feedDenied = false;
+      dbg("feed", `已订阅 ${n}/${ids.length} 个项目`);
+    } catch (err) {
+      if (err?.code === "NOT_GRANTED") {
+        feedDenied = true;
+        dbg("feed", "NOT_GRANTED：设置里允许会话访问后覆盖全部会话");
+      } else {
+        dbg("feed", "不可用，仅当前会话");
+      }
+    }
+    renderStatus();
+  }
+  var DBG_KEY = "chime:debug";
+  var dbgBuf = [];
+  var dbgTimer = null;
+  function shortId(id) {
+    return id.length > 12 ? "…" + id.slice(-8) : id;
+  }
+  function dbg(kind, info) {
+    dbgBuf.push({ t: (/* @__PURE__ */ new Date()).toLocaleTimeString(), kind, info });
+    while (dbgBuf.length > 40) dbgBuf.shift();
+    if (dbgTimer) return;
+    dbgTimer = setTimeout(() => {
+      dbgTimer = null;
+      host.storage.set(DBG_KEY, dbgBuf).catch(() => {
+      });
+    }, 500);
+  }
   var d = (id) => document.getElementById(id);
   function setStatus(msg) {
     const el = d("status");
@@ -1226,8 +1347,9 @@
   var svcUploading = /* @__PURE__ */ new Map();
   var SVC_CHUNK = 63500;
   function renderStatus() {
-    const tail = svcState === "ready" ? " · 系统播放就绪：面板关闭也会响" : svcState === "denied" ? " · 系统播放未授权（Settings → Extensions 允许本地服务后生效），当前仅面板内播放" : svcState === "broken" ? " · 系统服务异常，回退面板播放" : "";
-    setStatus("监听已连接 ✓" + tail);
+    const svcTail = svcState === "ready" ? " · 系统播放就绪：面板关闭也会响" : svcState === "denied" ? " · 系统播放未授权（Settings → Extensions 允许本地服务后生效），当前仅面板内播放" : svcState === "broken" ? " · 系统服务异常，回退面板播放" : "";
+    const feedTail = feedOn ? ` · 全会话监听开（${feedProjects} 个项目）` : feedDenied ? " · 全会话监听未授权（允许会话访问后后台任务也响），当前仅正在看的会话" : "";
+    setStatus("监听已连接 ✓" + svcTail + feedTail);
   }
   async function svcCall(method, path, body) {
     if (typeof host.serviceRequest !== "function") return null;
@@ -1241,11 +1363,13 @@
       const code = err?.code;
       if (code === "NO_SERVICE" || code === "DISABLED") svcState = "denied";
       else if (code === "SERVICE_FAILED") svcState = "broken";
+      dbg("svc", `${path} err=${code ?? "unknown"}`);
       renderStatus();
       return null;
     }
   }
   async function warmService() {
+    dbg("svc", "warm /health …");
     const r = await svcCall("GET", "/health");
     if (r && r.status === 200) {
       svcState = "ready";
@@ -1309,8 +1433,12 @@
     return false;
   }
   async function playSelected() {
-    if (await playViaService(sound)) return;
+    if (await playViaService(sound)) {
+      dbg("play", `service ok · ${displayName(sound)} · vol ${volume}`);
+      return;
+    }
     const ok = await playSound(sound);
+    dbg("play", ok ? `webaudio ok · ${displayName(sound)}` : "webaudio fail → synth");
     if (!ok) synthDing();
   }
   function rebuildSelect() {
@@ -1499,7 +1627,10 @@
       };
       vol.onchange = () => host.storage.set("volume", volume);
     }
-    if (test) test.onclick = () => playSelected();
+    if (test) test.onclick = () => {
+      void ensureFeed();
+      playSelected();
+    };
     if (del) del.onclick = handleDeleteClick;
     if (imp && file) {
       imp.onclick = () => file.click();
@@ -1511,24 +1642,17 @@
     }
     renderStatus();
     void warmService();
+    void ensureFeed();
   });
   host.onSessionLifecycle((event) => {
     const { sessionId, phase } = event;
+    dbg("event", `${phase} · ${shortId(sessionId)} · turn=${feed.get(sessionId)?.turn ?? 0}`);
     if (phase === "started") {
-      running.add(sessionId);
+      noteTurn(sessionId);
       return;
     }
     if (phase === "completed" || phase === "failure") {
-      if (!running.delete(sessionId)) {
-        return;
-      }
-      if (phase === "completed") {
-        if (!onlyFailure) chime();
-        else setLast("任务完成（静音） " + (/* @__PURE__ */ new Date()).toLocaleTimeString());
-      } else {
-        chime().catch(() => {
-        }).then(() => setLast("⚠️ 任务失败 " + (/* @__PURE__ */ new Date()).toLocaleTimeString()));
-      }
+      settleTurn(sessionId, phase === "failure" ? "failed" : "completed");
     }
   });
   Promise.all([
